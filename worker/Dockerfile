@@ -1,15 +1,13 @@
 # syntax=docker/dockerfile:1
 
-# ---- Stage 1: Builder ----
 FROM python:3.12-slim AS builder
 
 WORKDIR /build
 
 COPY requirements.txt .
-RUN pip install --upgrade pip && \
+RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir --prefix=/install -r requirements.txt
 
-# ---- Stage 2: Runtime ----
 FROM python:3.12-slim AS runtime
 
 RUN addgroup --system appgroup && adduser --system --ingroup appgroup appuser
