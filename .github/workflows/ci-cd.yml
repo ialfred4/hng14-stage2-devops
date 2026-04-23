@@ -140,6 +140,7 @@ jobs:
       - if: always()
         run: docker compose down -v --remove-orphans
 
+
   deploy:
     name: Deploy
     runs-on: ubuntu-latest
@@ -150,30 +151,27 @@ jobs:
       - uses: webfactory/ssh-agent@v0.9.0
         with:
           ssh-private-key: ${{ secrets.DEPLOY_SSH_KEY }}
-      - env:
+      - name: Deploy rolling update
+        env:
           DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
           DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
           DEPLOY_PATH: ${{ secrets.DEPLOY_PATH }}
         run: |
-          ssh -o StrictHostKeyChecking=no "$DEPLOY_USER@$DEPLOY_HOST" bash << 'ENDSSH'
-          set -e
-          cd $DEPLOY_PATH
-          git pull origin main
-          docker compose build
-          for SERVICE in api worker frontend; do
-            OLD=$(docker compose ps -q $SERVICE 2>/dev/null || echo "")
-            docker compose up -d --no-deps --build $SERVICE
-            NEW=$(docker compose ps -q $SERVICE)
-            HEALTHY=false
-            for i in $(seq 1 12); do
-              HEALTH=$(docker inspect --format='{{.State.Health.Status}}' "$NEW" 2>/dev/null || echo "none")
-              if [ "$HEALTH" = "healthy" ]; then HEALTHY=true; break; fi
-              sleep 5
+          ssh -o StrictHostKeyChecking=no "$DEPLOY_USER@$DEPLOY_HOST" "
+            set -e
+            cd $DEPLOY_PATH
+            git pull origin main
+            docker compose build
+            for SERVICE in api worker frontend; do
+              docker compose up -d --no-deps --build \$SERVICE
+              NEW=\$(docker compose ps -q \$SERVICE)
+              HEALTHY=false
+              for i in \$(seq 1 12); do
+                HEALTH=\$(docker inspect --format='{{.State.Health.Status}}' \$NEW 2>/dev/null || echo none)
+                if [ \"\$HEALTH\" = healthy ]; then HEALTHY=true; break; fi
+                sleep 5
+              done
+              if [ \"\$HEALTHY\" = false ]; then exit 1; fi
             done
-            if [ "$HEALTHY" = "false" ]; then
-              [ -n "$OLD" ] && docker start "$OLD" 2>/dev/null || true
-              exit 1
-            fi
-            [ -n "$OLD" ] && [ "$OLD" != "$NEW" ] && docker stop "$OLD" && docker rm "$OLD" || true
-          done
-ENDSSH
+            echo Deploy complete
+          "
