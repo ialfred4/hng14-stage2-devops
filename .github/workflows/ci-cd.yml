@@ -1,0 +1,179 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: [main]
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install flake8
+      - run: flake8 api/main.py worker/worker.py api/tests/
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - run: npm install --prefix frontend
+      - run: npm run lint --prefix frontend
+      - run: |
+          curl -sSL https://github.com/hadolint/hadolint/releases/download/v2.12.0/hadolint-Linux-x86_64 -o /usr/local/bin/hadolint
+          chmod +x /usr/local/bin/hadolint
+          hadolint api/Dockerfile
+          hadolint worker/Dockerfile
+          hadolint frontend/Dockerfile
+
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    needs: lint
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r api/requirements.txt pytest pytest-cov httpx
+      - working-directory: api
+        run: python -m pytest tests/ -v --cov=. --cov-report=xml:coverage.xml --cov-report=html:htmlcov
+      - uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: |
+            api/coverage.xml
+            api/htmlcov/
+
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    needs: test
+    services:
+      registry:
+        image: registry:2
+        ports:
+          - 5000:5000
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+        with:
+          driver-opts: network=host
+      - uses: docker/build-push-action@v5
+        with:
+          context: ./api
+          push: true
+          tags: localhost:5000/api:${{ github.sha }},localhost:5000/api:latest
+          network: host
+      - uses: docker/build-push-action@v5
+        with:
+          context: ./worker
+          push: true
+          tags: localhost:5000/worker:${{ github.sha }},localhost:5000/worker:latest
+          network: host
+      - uses: docker/build-push-action@v5
+        with:
+          context: ./frontend
+          push: true
+          tags: localhost:5000/frontend:${{ github.sha }},localhost:5000/frontend:latest
+          network: host
+
+  security-scan:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          docker build -t localhost:5000/api:${{ github.sha }} ./api
+          docker build -t localhost:5000/worker:${{ github.sha }} ./worker
+          docker build -t localhost:5000/frontend:${{ github.sha }} ./frontend
+      - run: |
+          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin v0.51.1
+          trivy image --exit-code 1 --severity CRITICAL --format sarif --output trivy-api.sarif localhost:5000/api:${{ github.sha }}
+          trivy image --exit-code 1 --severity CRITICAL --format sarif --output trivy-worker.sarif localhost:5000/worker:${{ github.sha }}
+          trivy image --exit-code 1 --severity CRITICAL --format sarif --output trivy-frontend.sarif localhost:5000/frontend:${{ github.sha }}
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: trivy-sarif-results
+          path: "*.sarif"
+
+  integration-test:
+    name: Integration Test
+    runs-on: ubuntu-latest
+    needs: security-scan
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          echo "REDIS_PASSWORD=integrationtestpassword" > .env
+          echo "FRONTEND_PORT=3000" >> .env
+      - run: docker compose build
+      - run: docker compose up -d
+      - run: |
+          for i in $(seq 1 30); do
+            FRONTEND=$(docker inspect --format='{{.State.Health.Status}}' hng14-stage2-devops-frontend-1 2>/dev/null || echo "")
+            API=$(docker inspect --format='{{.State.Health.Status}}' hng14-stage2-devops-api-1 2>/dev/null || echo "")
+            echo "Attempt $i: frontend=$FRONTEND api=$API"
+            if [ "$FRONTEND" = "healthy" ] && [ "$API" = "healthy" ]; then
+              echo "Stack healthy!"
+              break
+            fi
+            sleep 5
+          done
+      - id: submit
+        run: |
+          RESPONSE=$(curl -sf -X POST http://localhost:3000/submit -H "Content-Type: application/json")
+          JOB_ID=$(echo "$RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin)['job_id'])")
+          echo "job_id=$JOB_ID" >> "$GITHUB_OUTPUT"
+      - run: |
+          for i in $(seq 1 20); do
+            STATUS=$(curl -sf http://localhost:3000/status/${{ steps.submit.outputs.job_id }} | python3 -c "import sys,json; print(json.load(sys.stdin)['status'])")
+            echo "Poll $i: $STATUS"
+            if [ "$STATUS" = "completed" ]; then exit 0; fi
+            sleep 3
+          done
+          exit 1
+      - if: always()
+        run: docker compose down -v --remove-orphans
+
+  deploy:
+    name: Deploy
+    runs-on: ubuntu-latest
+    needs: integration-test
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.DEPLOY_SSH_KEY }}
+      - env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+          DEPLOY_PATH: ${{ secrets.DEPLOY_PATH }}
+        run: |
+          ssh -o StrictHostKeyChecking=no "$DEPLOY_USER@$DEPLOY_HOST" bash << 'ENDSSH'
+          set -e
+          cd $DEPLOY_PATH
+          git pull origin main
+          docker compose build
+          for SERVICE in api worker frontend; do
+            OLD=$(docker compose ps -q $SERVICE 2>/dev/null || echo "")
+            docker compose up -d --no-deps --build $SERVICE
+            NEW=$(docker compose ps -q $SERVICE)
+            HEALTHY=false
+            for i in $(seq 1 12); do
+              HEALTH=$(docker inspect --format='{{.State.Health.Status}}' "$NEW" 2>/dev/null || echo "none")
+              if [ "$HEALTH" = "healthy" ]; then HEALTHY=true; break; fi
+              sleep 5
+            done
+            if [ "$HEALTHY" = "false" ]; then
+              [ -n "$OLD" ] && docker start "$OLD" 2>/dev/null || true
+              exit 1
+            fi
+            [ -n "$OLD" ] && [ "$OLD" != "$NEW" ] && docker stop "$OLD" && docker rm "$OLD" || true
+          done
+ENDSSH
